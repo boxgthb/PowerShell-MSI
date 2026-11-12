@@ -1,0 +1,124 @@
+name: Official ZIP to MSI
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: 'Official Windows x64 ZIP URL (leave blank for latest stable)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+# Both manual workflows publish the same versioned assets, one run at a time.
+concurrency:
+  group: community-msi-publication
+  cancel-in-progress: false
+
+env:
+  POWERSHELL_TELEMETRY_OPTOUT: '1'
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  resolve:
+    name: Resolve official ZIP URL or latest stable
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version_tag: ${{ steps.resolve.outputs.version_tag }}
+      commit: ${{ steps.resolve.outputs.commit }}
+      private_tag_commit: ${{ steps.resolve.outputs.private_tag_commit }}
+    steps:
+      - name: Check out the automation commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Resolve version and official SHA256
+        id: resolve
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ZIP_URL: ${{ inputs.zip_url }}
+        run: ./tools/msi-build/Resolve-OfficialZip.ps1 -ZipURL $env:ZIP_URL -OutputPath ./resolved/official-zip.json
+      - name: Save the immutable ZIP selection
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: official-zip-selection
+          path: resolved/official-zip.json
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    name: Package unchanged official ZIP using restored WiX
+    needs: resolve
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - name: Check out the resolved automation commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          persist-credentials: false
+      - name: Download the official ZIP selection
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: official-zip-selection
+          path: resolved
+      - name: Download, check hashes and package
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SYSTEM_ARTIFACTSDIRECTORY: ${{ github.workspace }}/artifacts/build-diagnostics
+        run: ./tools/msi-build/Build-Msi.ps1 -OfficialReleasePath ./resolved/official-zip.json -OutputDirectory ./artifacts
+      - name: Save the MSI and build records
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: msi-package-${{ needs.resolve.outputs.version_tag }}
+          path: |
+            artifacts/*.msi
+            artifacts/*.json
+            artifacts/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+      - name: Save build diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: msi-build-logs-${{ needs.resolve.outputs.version_tag }}
+          path: |
+            artifacts/*.log
+            artifacts/build-diagnostics/**
+          if-no-files-found: warn
+          retention-days: 7
+
+  release:
+    name: Publish ZIP-derived MSI
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the packaging scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          persist-credentials: false
+      - name: Download the MSI and build records
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: msi-package-${{ needs.resolve.outputs.version_tag }}
+          path: artifacts
+      - name: Create or replace the versioned release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION_TAG: ${{ needs.resolve.outputs.version_tag }}
+          BUILT_COMMIT: ${{ needs.resolve.outputs.commit }}
+          AUTOMATION_COMMIT: ${{ needs.resolve.outputs.commit }}
+          TAG_COMMIT_AT_START: ${{ needs.resolve.outputs.private_tag_commit }}
+          PACKAGING_MODE: OfficialZIP
+        run: bash ./tools/msi-build/Publish-MsiRelease.sh
